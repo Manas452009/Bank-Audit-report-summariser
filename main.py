@@ -6,6 +6,7 @@ from typing import Dict,List,Optional
 from fastapi import FastAPI,File,HTTPException,UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+
 def clean_text(t):
  if not t:return ''
  t=re.sub(r'(.)\\1{2,}',r'\\1',t);t=re.sub(r'\\s+',' ',t);return t.strip()
@@ -104,8 +105,10 @@ app.add_middleware(
 _ac={}
 @app.get('/')
 def root():return{'service':'Bank Audit Report Summarizer','version':'1.0.0','status':'ready','endpoints':{'POST /process-pdf':'Upload PDF for full analysis','POST /analyze-text':'Submit text rows','GET /health':'Health check','GET /summary':'Get cached summary','POST /query':'Query cached results'}}
+
 @app.get('/health')
 def health_check():return{'status':'healthy','cached_results':len(_ac)}
+
 @app.post('/process-pdf')
 async def process_pdf(file:UploadFile=File(...)):
  if not file.filename.lower().endswith('.pdf'):raise HTTPException(status_code=400,detail='File must be a PDF')
@@ -118,6 +121,7 @@ async def process_pdf(file:UploadFile=File(...)):
   _ac[ck]={'df':df.to_dict(orient='records'),'summary':s}
   return JSONResponse(status_code=200,content={'success':True,'message':'PDF processed successfully','extracted_data':{'text_paragraphs':len(td),'tables':len(tt),'financial_tables':len(ft),'structured_rows':len(sd)},'summary':s})
  except Exception as e:raise HTTPException(status_code=500,detail=f'PDF processing failed:{str(e)}')
+
 @app.post('/analyze-text')
 async def analyze_text(data:dict):
  sr=data.get('structured_rows',[])
