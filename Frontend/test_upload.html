@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Upload Test - Frontend Mock</title>
+    <style>
+        body { font-family: sans-serif; padding: 2rem; background: #0a1628; color: #fff; }
+        .test-area { border: 2px dashed #4ade80; padding: 2rem; border-radius: 8px; text-align: center; }
+        .result { background: rgba(0,0,0,0.3); padding: 1rem; border-radius: 8px; margin-top: 1rem; white-space: pre-wrap; }
+        button { background: #4ade80; color: #0a1628; border: none; padding: 0.5rem 1rem; border-radius: 4px; cursor: pointer; }
+        .error { color: #ef4444; }
+    </style>
+</head>
+<body>
+    <h1>Test Upload to http://localhost:8000/process-pdf</h1>
+    <div class="test-area">
+        <p>This simulates the Summarizer component's upload behavior</p>
+        <button onclick="testUpload()">Test Upload (No File)</button>
+        <div id="result"></div>
+    </div>
+    <h2>What was implemented:</h2>
+    <ul>
+        <li>src/components/Summarizer.tsx - Added upload state (isUploading, uploadResult) and uploadFile() function</li>
+        <li>src/components/Summarizer.css - Added styles for uploading status and result display</li>
+        <li>vite.config.ts - Added proxy for /process-pdf to http://localhost:8000</li>
+    </ul>
+    <h2>How the upload works:</h2>
+    <ol>
+        <li>User selects/drops a file → file validation runs</li>
+        <li>If valid → uploadFile() creates FormData with the file</li>
+        <li>POST to http://localhost:8000/process-pdf with FormData</li>
+        <li>Response JSON is displayed in the upload-result section</li>
+    </ol>
+    <script>
+        async function testUpload() {
+            const result = document.getElementById('result');
+            try {
+                const response = await fetch('http://localhost:8000/process-pdf', {
+                    method: 'POST',
+                    body: new FormData()
+                });
+                const data = await response.json();
+                result.className = 'result';
+                result.textContent = JSON.stringify(data, null, 2);
+            } catch (err) {
+                result.className = 'result error';
+                result.textContent = 'Error: ' + err.message + '\\n\\n(Backend on port 8000 may not be running)\\n\\nExpected behavior: When a PDF is uploaded from Summarizer.tsx, it POSTs to http://localhost:8000/process-pdf with FormData containing the file.';
+            }
+        }
+    </script>
+</body>
+</html>
