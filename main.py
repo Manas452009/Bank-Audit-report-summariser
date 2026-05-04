@@ -10,9 +10,11 @@ import io
 import os
 import re
 import json
+import asyncio
 import tempfile
 import traceback
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -22,7 +24,11 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import Any
+from typing import Any, AsyncGenerator
+
+# Thread-pool for CPU-bound pdfplumber work (keeps async event loop free)
+_PDF_WORKERS = int(os.getenv("PDF_WORKERS", "4"))
+_executor = ThreadPoolExecutor(max_workers=_PDF_WORKERS)
 
 # ── reportlab ────────────────────────────────────────────────────────────────
 try:
@@ -39,10 +45,17 @@ except ImportError:
 # ── optional Gemini import ──────────────────────────────────────────────────
 try:
     import google.generativeai as genai
+    from google.generativeai.types import GenerationConfig
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
     if GEMINI_API_KEY:
         genai.configure(api_key=GEMINI_API_KEY)
-        _gemini_model = genai.GenerativeModel("models/gemini-2.5-flash-lite")
+        _gemini_model = genai.GenerativeModel(
+            "models/gemini-2.5-flash-lite",
+            generation_config=GenerationConfig(
+                max_output_tokens=8000,   # stay well within the 64k limit
+                temperature=0.3,
+            ),
+        )
     else:
         _gemini_model = None
 except ImportError:
@@ -106,27 +119,129 @@ def _is_high_value_financial_table(table: list) -> bool:
     return True
 
 
-def _extract_financial_tables(pdf_bytes: bytes) -> list:
-    """Return list of high-value financial tables from the PDF."""
-    table_data = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page_num, page in enumerate(pdf.pages):
+# ── Parallel page processor ──────────────────────────────────────────────────
+
+def _process_single_page(args: tuple) -> dict | None:
+    """
+    Process one PDF page (run in a thread). Returns a result dict or None.
+    args = (page_num, page_bytes_or_index, pdf_bytes)
+    We re-open only the target page via pdfplumber slice to stay thread-safe.
+    """
+    page_num, pdf_bytes = args
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            page = pdf.pages[page_num]
+            # Fast pre-filter: skip pages with no ruled lines at all
+            if not page.lines and not page.edges:
+                return {"page": page_num + 1, "skipped": True, "tables": []}
             tables = page.extract_tables({
                 "vertical_strategy": "lines",
                 "horizontal_strategy": "lines",
             })
-            for table in tables:
+            found = []
+            for table in (tables or []):
                 if not table:
                     continue
-                cleaned = []
-                for row in table:
-                    if any(cell is not None and str(cell).strip() != "" for cell in row):
-                        cleaned.append([str(cell).strip() if cell else "" for cell in row])
-                if len(cleaned) < 2:
-                    continue
-                if _is_high_value_financial_table(cleaned):
-                    table_data.append({"page": page_num + 1, "table": cleaned})
+                cleaned = [
+                    [str(cell).strip() if cell else "" for cell in row]
+                    for row in table
+                    if any(cell is not None and str(cell).strip() != "" for cell in row)
+                ]
+                if len(cleaned) >= 2 and _is_high_value_financial_table(cleaned):
+                    found.append(cleaned)
+            return {"page": page_num + 1, "skipped": False, "tables": found}
+    except Exception:
+        return {"page": page_num + 1, "skipped": True, "tables": [], "error": True}
+
+
+def _extract_financial_tables(pdf_bytes: bytes) -> list:
+    """Return list of high-value financial tables (parallel page processing)."""
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        total = len(pdf.pages)
+
+    args_list = [(i, pdf_bytes) for i in range(total)]
+    results = list(_executor.map(_process_single_page, args_list))
+
+    # Re-assemble in page order
+    table_data = []
+    for res in results:
+        if res and not res["skipped"]:
+            for tbl in res["tables"]:
+                table_data.append({"page": res["page"], "table": tbl})
     return table_data
+
+
+async def _stream_pdf_processing(
+    pdf_bytes: bytes, filename: str
+) -> AsyncGenerator[str, None]:
+    """
+    SSE generator: processes pages in parallel then streams progress events
+    so the client sees live updates without waiting for the full result.
+
+    Event types emitted (JSON payloads inside 'data: ...' lines):
+      { type: 'start',    total_pages: N }
+      { type: 'page',     page: N, tables_found: K }
+      { type: 'analysis', ...analysis_fields }
+      { type: 'done',     ...full_result }
+      { type: 'error',    message: '...' }
+    """
+    def _sse(payload: dict) -> str:
+        return f"data: {json.dumps(payload)}\n\n"
+
+    try:
+        # --- discover page count ---
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            total_pages = len(pdf.pages)
+
+        yield _sse({"type": "start", "total_pages": total_pages})
+
+        # --- submit all pages to thread-pool ---
+        loop = asyncio.get_event_loop()
+        futures = [
+            loop.run_in_executor(_executor, _process_single_page, (i, pdf_bytes))
+            for i in range(total_pages)
+        ]
+
+        # --- stream results as each page finishes ---
+        table_data = []
+        for coro in asyncio.as_completed(futures):
+            res = await coro
+            if res:
+                page_tables = res["tables"]
+                yield _sse({
+                    "type": "page",
+                    "page": res["page"],
+                    "tables_found": len(page_tables),
+                    "skipped": res.get("skipped", False),
+                })
+                for tbl in page_tables:
+                    table_data.append({"page": res["page"], "table": tbl})
+
+        # --- build structured rows ---
+        # Sort by page for deterministic analysis
+        table_data.sort(key=lambda x: x["page"])
+        structured_data = []
+        for item in table_data:
+            page = item["page"]
+            for row in _table_to_structured_text(item["table"]):
+                structured_data.append({"page": page, "text": row})
+
+        # --- analyse ---
+        analysis = _analyse_structured_data(structured_data)
+        yield _sse({"type": "analysis", **analysis})
+
+        # --- final complete payload ---
+        yield _sse({
+            "type": "done",
+            "filename": filename,
+            "financial_tables_found": len(table_data),
+            "structured_rows": len(structured_data),
+            "analysis": analysis,
+        })
+
+    except Exception as exc:
+        traceback.print_exc()
+        yield _sse({"type": "error", "message": str(exc)})
 
 
 def _clean_field_name(name: str) -> str:
@@ -266,18 +381,18 @@ async def process_pdf(file: UploadFile = File(...)):
     try:
         pdf_bytes = await file.read()
 
-        # 1. Extract high-value financial tables
-        financial_tables = _extract_financial_tables(pdf_bytes)
+        # Run blocking extraction in thread pool so async loop stays free
+        loop = asyncio.get_event_loop()
+        financial_tables = await loop.run_in_executor(
+            _executor, _extract_financial_tables, pdf_bytes
+        )
 
-        # 2. Convert tables → structured rows
         structured_data = []
         for item in financial_tables:
             page = item["page"]
-            rows = _table_to_structured_text(item["table"])
-            for row in rows:
+            for row in _table_to_structured_text(item["table"]):
                 structured_data.append({"page": page, "text": row})
 
-        # 3. Analyse structured rows
         analysis = _analyse_structured_data(structured_data)
 
         return {
@@ -290,6 +405,34 @@ async def process_pdf(file: UploadFile = File(...)):
     except Exception as exc:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"PDF processing failed: {str(exc)}")
+
+
+@app.post("/process-pdf-stream")
+async def process_pdf_stream(file: UploadFile = File(...)):
+    """
+    SSE endpoint — streams per-page progress then final analysis JSON.
+    The client reads events of the form:  data: {...}\\n\\n
+
+    Event shapes:
+      { type: 'start',    total_pages: N }
+      { type: 'page',     page: N, tables_found: K, skipped: bool }
+      { type: 'analysis', total_deposits, total_advances, ... }
+      { type: 'done',     filename, financial_tables_found, structured_rows, analysis }
+      { type: 'error',    message }
+    """
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
+
+    pdf_bytes = await file.read()
+
+    return StreamingResponse(
+        _stream_pdf_processing(pdf_bytes, file.filename),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",   # disable nginx buffering
+        },
+    )
 
 
 class SummaryRequest(BaseModel):
@@ -320,8 +463,23 @@ async def generate_summary(payload: dict):
 
         # ── Gemini path ──────────────────────────────────────────────────
         if _gemini_model:
-            prompt = f"""
-You are a senior banking auditor from a Big 4 consulting firm preparing a professional audit note for senior management.
+            # Limit row detail in prompt to avoid token overflow (max 20 rows)
+            MAX_ROWS_IN_PROMPT = 20
+            row_sample = rows[:MAX_ROWS_IN_PROMPT]
+            row_detail_lines = []
+            for i, r in enumerate(row_sample, 1):
+                ldr_v = r.get("LDR")
+                obs   = r.get("observations", "")
+                row_detail_lines.append(
+                    f"  Row {i}: Risk={r.get('risk_level','?')}, "
+                    f"LDR={f'{ldr_v:.2%}' if ldr_v is not None else 'N/A'}, "
+                    f"Obs={obs}"
+                )
+            row_detail_str = "\n".join(row_detail_lines)
+            if len(rows) > MAX_ROWS_IN_PROMPT:
+                row_detail_str += f"\n  ... and {len(rows) - MAX_ROWS_IN_PROMPT} more rows (summarized above)."
+
+            prompt = f"""You are a senior banking auditor from a Big 4 consulting firm preparing a professional audit note for senior management.
 
 STRICT FORMATTING RULES:
 1. Do NOT use any Markdown (no asterisks **, no hashes #, no bolding, no italics).
@@ -329,19 +487,19 @@ STRICT FORMATTING RULES:
 3. Use simple dashes (-) for bullet points.
 4. Ensure there is a blank line between each section.
 5. Do not write prepared by.
+6. Keep each section concise (3-5 sentences or bullet points maximum).
 
 Use ONLY the data provided below. Do NOT invent numbers. Do NOT assume facts not present.
 Use formal banking language.
 
-Prepare a structured report with the following sections:
-
+Prepare a structured report with these sections:
 1. Executive Summary
 2. Liquidity Position
 3. Credit Risk Review (analyze LDR, lending aggressiveness, concentration concerns)
 4. Investment Portfolio Review
-5. High Risk Accounts / Rows
-6. Overall Risk Rating (Low / Moderate / High)
-7. Recommendations (5 practical audit recommendations)
+5. High Risk Accounts
+6. Overall Risk Rating
+7. Recommendations (5 points)
 8. Final Management Note
 
 ==================================
@@ -356,6 +514,9 @@ Overall Risk          : {overall_risk}
 High Risk Rows        : {high_risk}
 Moderate Risk Rows    : {moderate_risk}
 Low Risk Rows         : {low_risk}
+
+ROW DETAIL SAMPLE:
+{row_detail_str}
 """
             response = _gemini_model.generate_content(prompt)
             summary_text = response.text
