@@ -65,9 +65,10 @@ app = FastAPI(title="BARS AI Service", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")],
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_credentials=True,
 )
 
 # ── PDF helpers (ported from notebook) ─────────────────────────────────────
